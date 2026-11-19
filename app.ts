@@ -1036,15 +1036,27 @@ function planFetch(r: Repo, wants: string[], haves: string[], shallowIn: string[
   const send: PackObject[] = [...included].sort().map((oid) => ({ oid, obj: r.objects.get(oid) as GObj })).filter((e) => e.obj !== undefined);
   return { send, shallow, unshallow, acks };
 }
-function sidebandPack(pack: Buffer): Buffer[] {
-  const parts: Buffer[] = [];
+function sidebandPack(pack: Buffer): Buffer {
+  // One pre-sized Buffer for the whole sideband stream: each 64 KiB chunk becomes
+  // one pkt-line (4-byte hex length + band byte 1 + chunk). Byte-identical to the
+  // old per-chunk pkt() + Buffer.concat assembly.
   const CHUNK = 65515;
-  for (let off = 0; off < pack.length; off += CHUNK) {
-    const chunk = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    parts.push(pkt(Buffer.concat([Buffer.from([1]), chunk])));
+  if (pack.length === 0) return pkt(Buffer.from([1]));
+  const n = Math.ceil(pack.length / CHUNK);
+  let total = 0;
+  for (let i = 0; i < n; i += 1) total += 4 + 1 + Math.min(CHUNK, pack.length - i * CHUNK);
+  const out = Buffer.alloc(total);
+  let off = 0;
+  for (let i = 0; i < n; i += 1) {
+    const start = i * CHUNK;
+    const len = Math.min(CHUNK, pack.length - start);
+    const frameLen = 1 + len + 4;
+    out.write(frameLen.toString(16).padStart(4, '0'), off, 4, 'ascii');
+    out[off + 4] = 1;
+    pack.copy(out, off + 5, start, start + len);
+    off += frameLen;
   }
-  if (pack.length === 0) parts.push(pkt(Buffer.from([1])));
-  return parts;
+  return out;
 }
 // Cache whole fetch responses per repo version + request key (clone workload hits this).
 const fetchCache = new Map<string, Buffer>();
@@ -1084,7 +1096,7 @@ function uploadPackV2(res: ServerResponse, r: Repo, body: Buffer): void {
     parts.push(PKT_FLUSH);
   }
   parts.push(pkt('packfile\n'));
-  for (const p of sidebandPack(pack)) parts.push(p);
+  parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
   const out = Buffer.concat(parts);
   if (fetchCache.size > 512) fetchCache.clear();
@@ -1113,7 +1125,7 @@ function uploadPackV0(res: ServerResponse, r: Repo, body: Buffer): void {
   else parts.push(pkt('NAK\n'));
   for (const s of plan.shallow) parts.push(pkt(`shallow ${s}\n`));
   for (const s of plan.unshallow) parts.push(pkt(`unshallow ${s}\n`));
-  for (const p of sidebandPack(pack)) parts.push(p);
+  parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
   sendBuf(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
@@ -1224,9 +1236,20 @@ function restRepo(res: ServerResponse, owner: string, name: string): Repo | null
   if (!r) { restNotFound(res); return null; }
   return r;
 }
-async function handleRest(req: IncomingMessage, res: ServerResponse, segs: string[], q: URLSearchParams, rawBody: Buffer): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, segs: string[], q: URLSearchParams, rawBody: Buffer, pathname: string): Promise<void> {
   const method = req.method ?? 'GET';
-  const pathname = new URL(req.url ?? '/', 'http://x').pathname;
+  // Fast path for the read workload: GET /repos/{owner}/{repo}/issues/{n}. This is
+  // exactly the branch the generic chain reaches below (same repo lookup, same
+  // parseInt, same find, same cached JSON), without walking the whole chain.
+  if (method === 'GET' && segs.length === 5 && segs[0] === 'repos' && segs[3] === 'issues') {
+    const r = restRepo(res, segs[1] as string, segs[2] as string);
+    if (!r) return;
+    const num = parseInt(segs[4] as string, 10);
+    const iss = r.issues.find((i) => i.number === num);
+    if (!iss) { restNotFound(res); return; }
+    sendJsonBuf(res, 200, issueJsonBuf(r, iss));
+    return;
+  }
   // JSON body (when present) for methods that carry one.
   let body: unknown;
   let bodyParsed = true;
@@ -2379,7 +2402,9 @@ export function createApp(): Server {
             const owner = gsegs[0] as string;
             const r = getRepo(owner, repoName);
             if (!r) { errJson(res, 404, 'Not Found'); return; }
-            const raw = await readBody(req);
+            // GETs (info/refs) carry no body: skip the readBody wait. POSTs
+            // (upload-pack / receive-pack) still read it.
+            const raw = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
             if (tail[0] === 'info') {
               const service = q.get('service') ?? '';
               if (service !== 'git-upload-pack' && service !== 'git-receive-pack') { errJson(res, 400, 'Missing service'); return; }
@@ -2421,9 +2446,12 @@ export function createApp(): Server {
         }
         if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
           if (!authed(req)) { errJson(res, 401, 'Requires authentication'); return; }
-          const raw = await readBody(req);
+          // GETs carry no body: skip the readBody wait (handleRest only parses
+          // a body for POST/PATCH/PUT/DELETE). Pass the already-parsed pathname
+          // so handleRest does not parse the URL a second time.
+          const raw = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
           const segs = pathSegments(pathname).slice(2);
-          await handleRest(req, res, segs, q, raw);
+          await handleRest(req, res, segs, q, raw, pathname);
           return;
         }
         errJson(res, 404, 'Not Found');
